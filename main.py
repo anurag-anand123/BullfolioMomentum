@@ -146,10 +146,10 @@ def main():
         # Set the exchange based on the selected country
         if country == 'us':
             suffix = ""  # US stocks don't need a suffix for yfinance
-            csv_file = 'us.csv'  # Replace with your US stock list CSV
+            csv_file = 'csv/us.csv'  # Replace with your US stock list CSV
         elif country == 'india':
             suffix = ".NS"
-            csv_file = 'india.csv'
+            csv_file = 'csv/india.csv'
 
         try:
             stock_limit = int(input("Enter the number of stocks you want to analyze from the top(by mCap): Top "))
