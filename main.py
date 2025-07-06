@@ -45,13 +45,13 @@ binance_dark = {
     "base_mpf_style": "binance-dark",
 }
 
-def read_csv_and_get_symbols(file_path):
+def read_csv_and_get_symbols(file_path, limit_from_top):
     """Read CSV and extract stock symbols."""
     try:
         df = pd.read_csv(file_path)
         if 'Symbol' not in df.columns:
             raise KeyError("The CSV file must contain a 'Symbol' column.")
-        return df['Symbol'].head(1300).tolist()
+        return df['Symbol'].head(limit_from_top).tolist()
     except FileNotFoundError:
         print(f"Error: File '{file_path}' not found.")
         return []
@@ -151,14 +151,36 @@ def main():
             suffix = ".NS"
             csv_file = 'india.csv'
 
+        try:
+            stock_limit = int(input("Enter the number of stocks you want to analyze from the top(by mCap): Top "))
+        except ValueError:
+            print("Invalid number. Please enter a valid integer.")
+            return
 
         duration_type = input("Do you want to enter the duration in 'weeks' or 'months'? ").strip().lower()
         if duration_type not in ['weeks', 'months']:
             print("Invalid choice. Please enter either 'weeks' or 'months'.")
             return
 
-        duration = int(input(f"Enter the number of {duration_type} for historical data: "))
-        interval = input("Enter the data interval (e.g., '1d' for daily, '1wk' for weekly, '1mo' for monthly): ").strip()
+        try:
+            duration = int(input(f"Enter the number of {duration_type} for historical data: "))
+        except ValueError:
+            print("Invalid number. Please enter a valid integer.")
+            return
+        
+        print("Choose a candle interval:")
+        print("  '1m'  - Daily candles")
+        print("  '5m'  - Daily candles")
+        print("  '1h'  - Daily candles")
+        print("  '4h'  - Daily candles")
+        print("  '1d'  - Daily candles")
+        print("  '1wk' - Weekly candles")
+        print("  '1mo' - Monthly candles")
+        print("Note: These are the most commonly used intervals.")
+        interval = input("Enter the candle interval (1m / 5m / 1h / 4h / 1d / 1wk / 1mo): ").strip()
+        if interval not in ['1m', '5m', '15m', '30m', '1h', '2h', '3h', '4h', '1d', '2d', '5d', '1wk', '2wk', '1mo', '3mo']:
+            print("Invalid choice. Please enter among '1m', '5m', '15m', '30m', '1h', '4h', '1d', '5d', '1wk', '1mo', '3mo'")
+            return
 
         if duration_type == 'weeks':
             start_date = (datetime.now() - timedelta(weeks=duration)).strftime('%Y-%m-%d')
@@ -175,7 +197,7 @@ def main():
         shutil.rmtree(GRAPH_FOLDER)
     os.makedirs(GRAPH_FOLDER)
 
-    symbols = read_csv_and_get_symbols(csv_file)
+    symbols = read_csv_and_get_symbols(csv_file, stock_limit)
     if not symbols:
         return
 
