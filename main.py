@@ -157,9 +157,9 @@ def main():
             print("Invalid number. Please enter a valid integer.")
             return
 
-        duration_type = input("Do you want to enter the duration in 'weeks' or 'months'? ").strip().lower()
-        if duration_type not in ['weeks', 'months']:
-            print("Invalid choice. Please enter either 'weeks' or 'months'.")
+        duration_type = input("Do you want to enter the duration in 'days', 'weeks' or 'months'? ").strip().lower()
+        if duration_type not in ['weeks', 'months', 'days']:
+            print("Invalid choice. Please enter either 'days', 'weeks' or 'months'.")
             return
 
         try:
@@ -186,13 +186,15 @@ def main():
             start_date = (datetime.now() - timedelta(weeks=duration)).strftime('%Y-%m-%d')
         elif duration_type == 'months':
             start_date = (datetime.now() - timedelta(days=duration * 30)).strftime('%Y-%m-%d')
+        elif duration_type == 'days':
+            start_date = (datetime.now() - timedelta(days=duration)).strftime('%Y-%m-%d')
 
         print(f"Fetching data from {start_date} with interval '{interval}'.")
     except ValueError:
         print("Invalid input. Please enter valid numbers and interval.")
         return
 
-    GRAPH_FOLDER = f"{duration}{duration_type}{interval}"
+    GRAPH_FOLDER = os.path.join("graph_stock", f"{duration}{duration_type}{interval}")
     if os.path.exists(GRAPH_FOLDER):
         shutil.rmtree(GRAPH_FOLDER)
     os.makedirs(GRAPH_FOLDER)
