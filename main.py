@@ -169,10 +169,10 @@ def main():
             return
         
         print("Choose a candle interval:")
-        print("  '1m'  - Daily candles")
-        print("  '5m'  - Daily candles")
-        print("  '1h'  - Daily candles")
-        print("  '4h'  - Daily candles")
+        print("  '1m'  - 1-minute candles")
+        print("  '5m'  - 5-minutes candles")
+        print("  '1h'  - 1-hour candles")
+        print("  '4h'  - 5-hours candles")
         print("  '1d'  - Daily candles")
         print("  '1wk' - Weekly candles")
         print("  '1mo' - Monthly candles")
