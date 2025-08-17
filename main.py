@@ -1,230 +1,284 @@
+import os
+import shutil
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# IMPORTANT: set non-interactive backend before importing mplfinance / pyplot
+import matplotlib
+matplotlib.use("Agg")   # <-- prevents MacOSX NSWindow errors when plotting in threads
+
 import pandas as pd
 import yfinance as yf
 import mplfinance as mpf
-from datetime import datetime, timedelta
-import os
-import shutil
+import multiprocessing
 
-# Constants
-GRAPH_FOLDER = 'graph_custom'
-
+# ----------------- Configuration -----------------
+GRAPH_ROOT = "graph_stock"
 suffix = ""
 csv_file = ""
 
-# Binance Dark Theme
-binance_dark = {
-    "base_mpl_style": "dark_background",
-    "marketcolors": {
-        "candle": {"up": "#3dc985", "down": "#ef4f60"},
-        "edge": {"up": "#3dc985", "down": "#ef4f60"},
-        "wick": {"up": "#3dc985", "down": "#ef4f60"},
-        "ohlc": {"up": "green", "down": "red"},
-        "volume": {"up": "#247252", "down": "#82333f"},
-        "vcedge": {"up": "green", "down": "red"},
-        "vcdopcod": False,
-        "alpha": 1,
-    },
-    "mavcolors": ("#ad7739", "#a63ab2", "#62b8ba"),
-    "facecolor": "#1b1f24",
-    "gridcolor": "#2c2e31",
-    "gridstyle": "--",
-    "y_on_right": True,
-    "rc": {
+# Create an mplfinance style with mpf.make_mpf_style
+binance_dark = mpf.make_mpf_style(
+    base_mpl_style="dark_background",
+    marketcolors=mpf.make_marketcolors(
+        up="#3dc985",
+        down="#ef4f60",
+        edge={"up": "#3dc985", "down": "#ef4f60"},
+        wick={"up": "#3dc985", "down": "#ef4f60"},
+        volume={"up": "#247252", "down": "#82333f"},
+    ),
+    facecolor="#1b1f24",
+    gridcolor="#2c2e31",
+    gridstyle="--",
+    y_on_right=True,
+    rc={
         "axes.grid": True,
         "axes.grid.axis": "y",
         "axes.edgecolor": "#474d56",
         "axes.titlecolor": "red",
         "figure.facecolor": "#161a1e",
-        "figure.titlesize": 10,  # Reduced title size
-        "figure.titleweight": "semibold",
-        "axes.labelsize": 5,  # Reduced label size
-        "axes.titlesize": 8,  # Reduced axes title size
-        "xtick.labelsize": 5,  # Reduced x-axis tick label size
-        "ytick.labelsize": 5,  # Reduced y-axis tick label size
-    },
-    "base_mpf_style": "binance-dark",
-}
+        "figure.titlesize": 10,
+        "axes.labelsize": 5,
+        "axes.titlesize": 8,
+        "xtick.labelsize": 5,
+        "ytick.labelsize": 5,
+    }
+)
+# -------------------------------------------------
 
 def read_csv_and_get_symbols(file_path, limit_from_top):
-    """Read CSV and extract stock symbols."""
     try:
         df = pd.read_csv(file_path)
         if 'Symbol' not in df.columns:
-            raise KeyError("The CSV file must contain a 'Symbol' column.")
-        return df['Symbol'].head(limit_from_top).tolist()
-    except FileNotFoundError:
-        print(f"Error: File '{file_path}' not found.")
-        return []
-    except KeyError as e:
-        print(e)
+            raise KeyError("CSV must have a 'Symbol' column.")
+        syms = df['Symbol'].astype(str).str.strip().tolist()
+        # Basic cleaning: uppercase, remove duplicates while preserving order
+        seen = set()
+        cleaned = []
+        for s in syms:
+            s_up = s.upper()
+            if s_up not in seen:
+                cleaned.append(s_up)
+                seen.add(s_up)
+        return cleaned[:limit_from_top]
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
         return []
 
-def fetch_stock_data(symbol, start_date, interval):
-    """Fetch historical stock data for a given symbol."""
+def fetch_all_stock_data(symbols, start_date, interval, auto_adjust=True):
+    """Download all tickers in one call. Return raw yfinance object and a list of failed symbols."""
+    tickers = [f"{s}{suffix}" for s in symbols]
     try:
-        symbol_with_suffix = f"{symbol}{suffix}"
-        data = yf.download(symbol_with_suffix, start=start_date, interval=interval)
-        if data.empty or len(data) < 2:
-            print(f"Insufficient data for {symbol}.")
+        # Explicitly set auto_adjust to avoid yfinance message. threads=True to speed up.
+        raw = yf.download(tickers, start=start_date, interval=interval, group_by="ticker", threads=True, auto_adjust=auto_adjust)
+        return raw
+    except Exception as e:
+        print(f"Error fetching data for multiple tickers: {e}")
+        return None
+
+def get_single_symbol_df_from_raw(raw_data, symbol_with_suffix):
+    """Extract symbol dataframe from yfinance multi-ticker raw download safely."""
+    try:
+        if isinstance(raw_data.columns, pd.MultiIndex):
+            df = raw_data[symbol_with_suffix].copy()
+        else:
+            df = raw_data.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col not in df.columns:
+                return None
+        df = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna()
+        df.index = pd.to_datetime(df.index)
+        if df.empty:
             return None
-        return data
-    except Exception as e:
-        print(f"Error fetching data for {symbol}: {e}")
+        return df
+    except Exception:
         return None
 
-def calculate_return(data):
-    """Calculate stock return for the given data."""
+def calculate_return(df):
     try:
-        # Extract scalar values using .iloc[0].item()
-        start_price = data['Close'].iloc[0].item()
-        end_price = data['Close'].iloc[-1].item()
+        # Ensure there are at least two data points to calculate a return
+        if len(df) < 2:
+            return 0.0
+        start_price = float(df['Close'].iloc[0])
+        end_price = float(df['Close'].iloc[-1])
         return ((end_price - start_price) / start_price) * 100
-    except Exception as e:
-        print(f"Error calculating return: {e}")
+    except Exception:
         return None
 
-def clean_and_prepare_data(data, symbol):
-    """Clean and prepare the data for mplfinance."""
+def save_candlestick_chart(symbol, df, rank, return_percent, out_folder):
+    """Plot and save chart using Agg backend (safe in threads)."""
     try:
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.map('_'.join).str.strip()
-
-        column_mapping = {
-            f"Close_{symbol}{suffix}": 'Close',
-            f'High_{symbol}{suffix}': 'High',
-            f'Low_{symbol}{suffix}': 'Low',
-            f'Open_{symbol}{suffix}': 'Open',
-            f'Volume_{symbol}{suffix}': 'Volume',
-        }
-        data = data.rename(columns=column_mapping)
-
-        required_columns = ['Open', 'High', 'Low', 'Close']
-        if not all(col in data.columns for col in required_columns):
-            raise KeyError(f"Required columns {required_columns} not found in data.")
-
-        data = data[required_columns].apply(pd.to_numeric, errors='coerce').dropna()
-        data.index = pd.to_datetime(data.index)
-        return data
-    except Exception as e:
-        print(f"Error cleaning and preparing data: {e}")
-        return None
-
-def save_candlestick_chart(data, symbol, rank, return_percent):
-    """Save the candlestick chart."""
-    try:
-        data = clean_and_prepare_data(data, symbol)
-        if data is None or data.empty:
-            print(f"Insufficient or invalid data for {symbol}.")
-            return
-
-        file_name = os.path.join(GRAPH_FOLDER, f"{rank}.png")
+        fname = os.path.join(out_folder, f"{rank:03d}_{symbol}.png")
         title = f"{symbol} - Return: {return_percent:.2f}%"
         mpf.plot(
-            data,
+            df,
             type='candle',
             style=binance_dark,
             title=title,
             ylabel='Price',
-            savefig=dict(fname=file_name, dpi=300, bbox_inches='tight'),
+            savefig=dict(fname=fname, dpi=300, bbox_inches='tight'),
             figratio=(20, 9),
             figscale=0.8,
+            #volume=True, # <-- Added volume to the plot
         )
-        print(f"Candlestick chart saved for {symbol} as {file_name}.")
+        return True, fname
     except Exception as e:
-        print(f"Error saving candlestick chart for {symbol}: {e}")
+        return False, str(e)
+
+# <-- NEW: Helper function to get duration details from user
+def get_duration_details(prompt_message):
+    print(prompt_message)
+    duration_type = input("Duration type ('days', 'weeks', 'months'): ").strip().lower()
+    if duration_type not in ['days', 'weeks', 'months']:
+        print("Invalid duration type. Exiting.")
+        return None, None, None
+    try:
+        duration = int(input(f"Enter the number of {duration_type}: "))
+    except ValueError:
+        print("Invalid duration. Exiting.")
+        return None, None, None
+    
+    if duration_type == 'weeks':
+        start_date_dt = datetime.now() - timedelta(weeks=duration)
+    elif duration_type == 'months':
+        start_date_dt = datetime.now() - timedelta(days=duration * 30)
+    else: # days
+        start_date_dt = datetime.now() - timedelta(days=duration)
+        
+    return duration, duration_type, start_date_dt
 
 def main():
-    global suffix, csv_file, GRAPH_FOLDER
-    """Main function to execute the script."""
-    try:
-        # Ask user to select the country
-        country = input("Do you want to analyze stocks from 'US(us)' or 'India(india)'? ").strip().lower()
-        if country not in ['us', 'india']:
-            print("Invalid choice. Please enter either 'US' or 'India'.")
-            return
+    global suffix, csv_file, GRAPH_ROOT
 
-        # Set the exchange based on the selected country
-        if country == 'us':
-            suffix = ""  # US stocks don't need a suffix for yfinance
-            csv_file = 'csv/us.csv'  # Replace with your US stock list CSV
-        elif country == 'india':
-            suffix = ".NS"
-            csv_file = 'csv/india.csv'
-
-        try:
-            stock_limit = int(input("Enter the number of stocks you want to analyze from the top(by mCap): Top "))
-        except ValueError:
-            print("Invalid number. Please enter a valid integer.")
-            return
-
-        duration_type = input("Do you want to enter the duration in 'days', 'weeks' or 'months'? ").strip().lower()
-        if duration_type not in ['weeks', 'months', 'days']:
-            print("Invalid choice. Please enter either 'days', 'weeks' or 'months'.")
-            return
-
-        try:
-            duration = int(input(f"Enter the number of {duration_type} for historical data: "))
-        except ValueError:
-            print("Invalid number. Please enter a valid integer.")
-            return
-        
-        print("Choose a candle interval:")
-        print("  '1m'  - 1-minute candles")
-        print("  '5m'  - 5-minutes candles")
-        print("  '1h'  - 1-hour candles")
-        print("  '4h'  - 5-hours candles")
-        print("  '1d'  - Daily candles")
-        print("  '1wk' - Weekly candles")
-        print("  '1mo' - Monthly candles")
-        print("Note: These are the most commonly used intervals.")
-        interval = input("Enter the candle interval (1m / 5m / 1h / 4h / 1d / 1wk / 1mo): ").strip()
-        if interval not in ['1m', '5m', '15m', '30m', '1h', '2h', '3h', '4h', '1d', '2d', '5d', '1wk', '2wk', '1mo', '3mo']:
-            print("Invalid choice. Please enter among '1m', '5m', '15m', '30m', '1h', '4h', '1d', '5d', '1wk', '1mo', '3mo'")
-            return
-
-        if duration_type == 'weeks':
-            start_date = (datetime.now() - timedelta(weeks=duration)).strftime('%Y-%m-%d')
-        elif duration_type == 'months':
-            start_date = (datetime.now() - timedelta(days=duration * 30)).strftime('%Y-%m-%d')
-        elif duration_type == 'days':
-            start_date = (datetime.now() - timedelta(days=duration)).strftime('%Y-%m-%d')
-
-        print(f"Fetching data from {start_date} with interval '{interval}'.")
-    except ValueError:
-        print("Invalid input. Please enter valid numbers and interval.")
+    country = input("Do you want to analyze stocks from 'US(us)' or 'India(india)'? ").strip().lower()
+    if country not in ['us', 'india']:
+        print("Invalid choice. Exiting.")
         return
 
-    GRAPH_FOLDER = os.path.join("graph_stock", f"{duration}{duration_type}{interval}")
-    if os.path.exists(GRAPH_FOLDER):
-        shutil.rmtree(GRAPH_FOLDER)
-    os.makedirs(GRAPH_FOLDER)
+    suffix = "" if country == "us" else ".NS"
+    csv_file = os.path.join("csv", "us.csv" if country == "us" else "india.csv")
+
+    try:
+        stock_limit = int(input("Enter number of stocks from top (by mCap): "))
+    except ValueError:
+        print("Invalid number. Exiting.")
+        return
+
+    # --- Get Analysis Duration ---
+    # <-- MODIFIED: Get duration for % calculation and sorting
+    analysis_duration, analysis_duration_type, analysis_start_date_dt = get_duration_details(
+        "\n--- Enter Analysis Duration (for % return calculation) ---"
+    )
+    if not analysis_duration: return
+
+    # --- Get Chart Duration ---
+    # <-- NEW: Get duration for the chart plot itself
+    chart_duration, chart_duration_type, chart_start_date_dt = get_duration_details(
+        "\n--- Enter Chart Duration (for the plot visualization) ---"
+    )
+    if not chart_duration: return
+
+    interval = input("Enter interval (e.g. '1m','5m','1h','4h','1d','1wk','1mo'): ").strip()
+    allowed_intervals = ['1m','5m','15m','30m','1h','2h','3h','4h','1d','2d','5d','1wk','2wk','1mo','3mo']
+    if interval not in allowed_intervals:
+        print("Invalid interval. Exiting.")
+        return
+    
+    # <-- MODIFIED: Determine the earliest start date needed to fetch all required data
+    fetch_start_date = min(analysis_start_date_dt, chart_start_date_dt)
+    fetch_start_date_str = fetch_start_date.strftime('%Y-%m-%d')
+    
+    # <-- MODIFIED: Output folder name is based on the analysis period
+    out_folder = os.path.join(GRAPH_ROOT, f"Analysis_{analysis_duration}{analysis_duration_type}_{interval}")
+    if os.path.exists(out_folder):
+        shutil.rmtree(out_folder)
+    os.makedirs(out_folder, exist_ok=True)
 
     symbols = read_csv_and_get_symbols(csv_file, stock_limit)
     if not symbols:
+        print("No symbols found. Exiting.")
         return
 
+    print(f"\nFetching data from {fetch_start_date_str} with interval '{interval}' (auto_adjust=True).")
+    raw_data = fetch_all_stock_data(symbols, fetch_start_date_str, interval, auto_adjust=True)
+    if raw_data is None or raw_data.empty:
+        print("No data returned by yfinance. Exiting.")
+        return
+    
     results = []
-    for symbol in symbols:
-        print(f"Processing {symbol}...")
-        data = fetch_stock_data(symbol, start_date, interval)
-        if data is not None:
-            stock_return = calculate_return(data)
-            if stock_return is not None:
-                results.append((symbol, stock_return, data))
+    failed_downloads = []
+    print("Calculating returns and preparing chart data...")
+    for sym in symbols:
+        sym_with_suffix = f"{sym}{suffix}"
+        full_df = get_single_symbol_df_from_raw(raw_data, sym_with_suffix)
+        if full_df is None or full_df.empty:
+            failed_downloads.append(sym_with_suffix)
+            continue
+        
+        # <-- MODIFIED: Slice the DataFrame for analysis and for charting
+        df_analysis = full_df[full_df.index >= analysis_start_date_dt]
+        df_chart = full_df[full_df.index >= chart_start_date_dt]
+
+        if df_analysis.empty or df_chart.empty:
+            failed_downloads.append(sym_with_suffix)
+            continue
+
+        ret = calculate_return(df_analysis) # <-- Return is calculated on the analysis slice
+        if ret is None:
+            failed_downloads.append(sym_with_suffix)
+            continue
+        
+        # <-- MODIFIED: Store the chart-specific dataframe in the results
+        results.append((sym, ret, df_chart))
 
     results.sort(key=lambda x: x[1], reverse=True)
 
-    for rank, (symbol, stock_return, data) in enumerate(results, start=1):
-        save_candlestick_chart(data, symbol, rank, stock_return)
-        print(f"{rank}. {symbol}: {stock_return:.2f}% return")
+    cpu = multiprocessing.cpu_count() or 4
+    max_workers = min(32, cpu + 4)
+
+    print(f"Creating charts in parallel using max_workers={max_workers} ...")
+    failed_charts = []
+    created_files = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        # <-- The rest of this section is unchanged, it correctly uses the df_chart stored in results
+        future_to_sym = {
+            ex.submit(save_candlestick_chart, sym, df, rank, ret, out_folder): (sym, rank)
+            for rank, (sym, ret, df) in enumerate(results, start=1)
+        }
+        for fut in as_completed(future_to_sym):
+            sym, rank = future_to_sym[fut]
+            ok, info = fut.result()
+            if not ok:
+                failed_charts.append((sym, info))
+            else:
+                created_files.append(info)
+    
+    print("\nTop results (based on analysis period):")
+    for rank, (sym, ret, _) in enumerate(results[:20], start=1): # Show top 20
+        print(f"{rank}. {sym} - {ret:.2f}%")
+
+    if failed_downloads:
+        print("\nFailed downloads (no data from yfinance):")
+        print(failed_downloads)
+
+    if failed_charts:
+        print("\nFailed to create chart for these symbols:")
+        for sym, err in failed_charts:
+            print(f"{sym} -> {err}")
+
+    print(f"\nSaved {len(created_files)} chart files to: {out_folder}")
 
     try:
         if os.name == 'nt':
-            os.startfile(GRAPH_FOLDER)
+            os.startfile(out_folder)
         elif os.name == 'posix':
-            os.system(f'open "{GRAPH_FOLDER}"' if 'darwin' in os.uname().sysname.lower() else f'xdg-open "{GRAPH_FOLDER}"')
+            uname = os.uname().sysname.lower()
+            if 'darwin' in uname:
+                os.system(f'open "{out_folder}"')
+            else:
+                os.system(f'xdg-open "{out_folder}"')
     except Exception as e:
-        print(f"Error opening folder: {e}")
+        print("Could not open folder automatically:", e)
 
 if __name__ == "__main__":
     main()

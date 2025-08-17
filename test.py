@@ -78,21 +78,15 @@ def fetch_all_stock_data(symbols, start_date, interval, auto_adjust=True):
 
 def get_single_symbol_df_from_raw(raw_data, symbol_with_suffix):
     """Extract symbol dataframe from yfinance multi-ticker raw download safely."""
-    # If raw_data has a MultiIndex (group_by='ticker'), raw_data[symbol_with_suffix] should work.
     try:
         if isinstance(raw_data.columns, pd.MultiIndex):
-            # Raw columns look like ('AAPL', 'Open'), so access by top-level ticker
             df = raw_data[symbol_with_suffix].copy()
         else:
-            # If only single-ticker returned or data was flattened, try to use raw_data directly,
-            # but likely this branch is for single symbol downloads.
             df = raw_data.copy()
-        # Ensure necessary columns exist
-        for col in ["Open", "High", "Low", "Close"]:
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
             if col not in df.columns:
                 return None
-        # Convert to numeric and drop NaNs
-        df = df[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna()
+        df = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna()
         df.index = pd.to_datetime(df.index)
         if df.empty:
             return None
@@ -102,6 +96,9 @@ def get_single_symbol_df_from_raw(raw_data, symbol_with_suffix):
 
 def calculate_return(df):
     try:
+        # Ensure there are at least two data points to calculate a return
+        if len(df) < 2:
+            return 0.0
         start_price = float(df['Close'].iloc[0])
         end_price = float(df['Close'].iloc[-1])
         return ((end_price - start_price) / start_price) * 100
@@ -111,7 +108,6 @@ def calculate_return(df):
 def save_candlestick_chart(symbol, df, rank, return_percent, out_folder):
     """Plot and save chart using Agg backend (safe in threads)."""
     try:
-        # mpf.plot with savefig: returns None normally; safe because we use non-interactive backend
         fname = os.path.join(out_folder, f"{rank:03d}_{symbol}.png")
         title = f"{symbol} - Return: {return_percent:.2f}%"
         mpf.plot(
@@ -123,10 +119,33 @@ def save_candlestick_chart(symbol, df, rank, return_percent, out_folder):
             savefig=dict(fname=fname, dpi=300, bbox_inches='tight'),
             figratio=(20, 9),
             figscale=0.8,
+            #volume=True, # <-- Added volume to the plot
         )
         return True, fname
     except Exception as e:
         return False, str(e)
+
+# <-- NEW: Helper function to get duration details from user
+def get_duration_details(prompt_message):
+    print(prompt_message)
+    duration_type = input("Duration type ('days', 'weeks', 'months'): ").strip().lower()
+    if duration_type not in ['days', 'weeks', 'months']:
+        print("Invalid duration type. Exiting.")
+        return None, None, None
+    try:
+        duration = int(input(f"Enter the number of {duration_type}: "))
+    except ValueError:
+        print("Invalid duration. Exiting.")
+        return None, None, None
+    
+    if duration_type == 'weeks':
+        start_date_dt = datetime.now() - timedelta(weeks=duration)
+    elif duration_type == 'months':
+        start_date_dt = datetime.now() - timedelta(days=duration * 30)
+    else: # days
+        start_date_dt = datetime.now() - timedelta(days=duration)
+        
+    return duration, duration_type, start_date_dt
 
 def main():
     global suffix, csv_file, GRAPH_ROOT
@@ -145,31 +164,32 @@ def main():
         print("Invalid number. Exiting.")
         return
 
-    duration_type = input("Duration type ('days', 'weeks', 'months'): ").strip().lower()
-    if duration_type not in ['days', 'weeks', 'months']:
-        print("Invalid duration type. Exiting.")
-        return
+    # --- Get Analysis Duration ---
+    # <-- MODIFIED: Get duration for % calculation and sorting
+    analysis_duration, analysis_duration_type, analysis_start_date_dt = get_duration_details(
+        "\n--- Enter Analysis Duration (for % return calculation) ---"
+    )
+    if not analysis_duration: return
 
-    try:
-        duration = int(input(f"Enter the number of {duration_type}: "))
-    except ValueError:
-        print("Invalid duration. Exiting.")
-        return
+    # --- Get Chart Duration ---
+    # <-- NEW: Get duration for the chart plot itself
+    chart_duration, chart_duration_type, chart_start_date_dt = get_duration_details(
+        "\n--- Enter Chart Duration (for the plot visualization) ---"
+    )
+    if not chart_duration: return
 
     interval = input("Enter interval (e.g. '1m','5m','1h','4h','1d','1wk','1mo'): ").strip()
     allowed_intervals = ['1m','5m','15m','30m','1h','2h','3h','4h','1d','2d','5d','1wk','2wk','1mo','3mo']
     if interval not in allowed_intervals:
         print("Invalid interval. Exiting.")
         return
-
-    if duration_type == 'weeks':
-        start_date = (datetime.now() - timedelta(weeks=duration)).strftime('%Y-%m-%d')
-    elif duration_type == 'months':
-        start_date = (datetime.now() - timedelta(days=duration * 30)).strftime('%Y-%m-%d')
-    else:
-        start_date = (datetime.now() - timedelta(days=duration)).strftime('%Y-%m-%d')
-
-    out_folder = os.path.join(GRAPH_ROOT, f"{duration}{duration_type}_{interval}")
+    
+    # <-- MODIFIED: Determine the earliest start date needed to fetch all required data
+    fetch_start_date = min(analysis_start_date_dt, chart_start_date_dt)
+    fetch_start_date_str = fetch_start_date.strftime('%Y-%m-%d')
+    
+    # <-- MODIFIED: Output folder name is based on the analysis period
+    out_folder = os.path.join(GRAPH_ROOT, f"Analysis_{analysis_duration}{analysis_duration_type}_{interval}")
     if os.path.exists(out_folder):
         shutil.rmtree(out_folder)
     os.makedirs(out_folder, exist_ok=True)
@@ -179,31 +199,40 @@ def main():
         print("No symbols found. Exiting.")
         return
 
-    print(f"Fetching data from {start_date} with interval '{interval}' (auto_adjust=True).")
-    raw_data = fetch_all_stock_data(symbols, start_date, interval, auto_adjust=True)
+    print(f"\nFetching data from {fetch_start_date_str} with interval '{interval}' (auto_adjust=True).")
+    raw_data = fetch_all_stock_data(symbols, fetch_start_date_str, interval, auto_adjust=True)
     if raw_data is None or raw_data.empty:
         print("No data returned by yfinance. Exiting.")
         return
-
-    # Build results list with per-symbol DataFrames and returns; track failed downloads
+    
     results = []
     failed_downloads = []
+    print("Calculating returns and preparing chart data...")
     for sym in symbols:
         sym_with_suffix = f"{sym}{suffix}"
-        df = get_single_symbol_df_from_raw(raw_data, sym_with_suffix)
-        if df is None or df.empty:
+        full_df = get_single_symbol_df_from_raw(raw_data, sym_with_suffix)
+        if full_df is None or full_df.empty:
             failed_downloads.append(sym_with_suffix)
             continue
-        ret = calculate_return(df)
+        
+        # <-- MODIFIED: Slice the DataFrame for analysis and for charting
+        df_analysis = full_df[full_df.index >= analysis_start_date_dt]
+        df_chart = full_df[full_df.index >= chart_start_date_dt]
+
+        if df_analysis.empty or df_chart.empty:
+            failed_downloads.append(sym_with_suffix)
+            continue
+
+        ret = calculate_return(df_analysis) # <-- Return is calculated on the analysis slice
         if ret is None:
             failed_downloads.append(sym_with_suffix)
             continue
-        results.append((sym, ret, df))
+        
+        # <-- MODIFIED: Store the chart-specific dataframe in the results
+        results.append((sym, ret, df_chart))
 
-    # Sort by return
     results.sort(key=lambda x: x[1], reverse=True)
 
-    # Choose number of workers based on CPU count (but not too many)
     cpu = multiprocessing.cpu_count() or 4
     max_workers = min(32, cpu + 4)
 
@@ -211,6 +240,7 @@ def main():
     failed_charts = []
     created_files = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        # <-- The rest of this section is unchanged, it correctly uses the df_chart stored in results
         future_to_sym = {
             ex.submit(save_candlestick_chart, sym, df, rank, ret, out_folder): (sym, rank)
             for rank, (sym, ret, df) in enumerate(results, start=1)
@@ -222,25 +252,22 @@ def main():
                 failed_charts.append((sym, info))
             else:
                 created_files.append(info)
-
-    # Print summary
-    print("\nTop results:")
-    for rank, (sym, ret, _) in enumerate(results, start=1):
+    
+    print("\nTop results (based on analysis period):")
+    for rank, (sym, ret, _) in enumerate(results[:20], start=1): # Show top 20
         print(f"{rank}. {sym} - {ret:.2f}%")
 
     if failed_downloads:
         print("\nFailed downloads (no data from yfinance):")
         print(failed_downloads)
-        print("Tip: check those tickers for typos or delisting (e.g. 'AIRTELPP.E1.NS' looks malformed).")
 
     if failed_charts:
-        print("\nFailed to create chart for these symbols (error message):")
+        print("\nFailed to create chart for these symbols:")
         for sym, err in failed_charts:
-            print(sym, "->", err)
+            print(f"{sym} -> {err}")
 
     print(f"\nSaved {len(created_files)} chart files to: {out_folder}")
 
-    # Try to open the folder (best-effort)
     try:
         if os.name == 'nt':
             os.startfile(out_folder)
